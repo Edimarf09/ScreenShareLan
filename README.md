@@ -83,6 +83,3 @@ Core/
   RoomServer.cs          # servidor UDP (relay + roster + anúncio)
   RoomClient.cs          # participante UDP (entra, compartilha, recebe)
 ```
-
-> Observação: o código foi escrito e revisado, mas **não foi compilado** neste ambiente
-> (WinForms só builda no Windows). Trate como uma base sólida pra buildar e testar aí.

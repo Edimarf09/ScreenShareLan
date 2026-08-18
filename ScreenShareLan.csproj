@@ -12,4 +12,18 @@
     <Platforms>x64</Platforms>
   </PropertyGroup>
 
+  <ItemGroup>
+    <None Include="executables\ffmpeg.exe">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <Link>executables\ffmpeg.exe</Link>
+    </None>
+  </ItemGroup>
+
+  <Target Name="CopyFfmpeg" AfterTargets="Publish">
+    <Copy SourceFiles="executables\ffmpeg.exe"
+          DestinationFolder="$(PublishDir)executables"
+          SkipUnchangedFiles="true" />
+  </Target>
+
 </Project>

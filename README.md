@@ -45,8 +45,7 @@ Precisa do **.NET SDK 10** no Windows.
 dotnet build -c Release
 
 # gerar UM .exe só, sem precisar de .NET instalado na máquina dos amigos:
-dotnet publish -c Release -r win-x64 --self-contained true ^
-  -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
+dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
 ```
 
 O `.exe` sai em:

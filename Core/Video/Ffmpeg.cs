@@ -19,7 +19,7 @@ public static class Ffmpeg
     {
         try
         {
-            var local = Path.Combine(AppContext.BaseDirectory, "ffmpeg.exe");
+            var local = Path.Combine(AppContext.BaseDirectory, "executables", "ffmpeg.exe");
             if (File.Exists(local)) return local;
         }
         catch { }

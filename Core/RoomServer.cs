@@ -6,10 +6,9 @@ using System.Text;
 namespace ScreenShareLan;
 
 /// <summary>
-/// Servidor da sala (roda no host). Tudo UDP:
-///  - controle: JOIN/HELLO/LEAVE/START/STOP
-///  - video: recebe do broadcaster ativo e faz relay pra todos os outros
-///  - envia ROSTER periodico e anuncia a sala por broadcast (pra "Lista da LAN")
+/// Servidor da sala (roda no host). So roteia bytes (relay), nao decodifica video.
+/// Agora suporta VARIOS broadcasters ao mesmo tempo: cada participante tem seu
+/// proprio estado de compartilhamento (Sharing + Preset).
 /// </summary>
 public sealed class RoomServer : IDisposable
 {
@@ -19,6 +18,9 @@ public sealed class RoomServer : IDisposable
         public string Name = "";
         public IPEndPoint EndPoint = null!;
         public DateTime LastSeen;
+        public bool Sharing;                       // <-- por participante
+        public SharePreset Preset;                 // <-- por participante
+        public CodecKind Codec;                    // <-- codec que essa pessoa esta usando
     }
 
     private readonly int _port;
@@ -28,8 +30,6 @@ public sealed class RoomServer : IDisposable
     private readonly object _lock = new();
     private readonly Dictionary<IPEndPoint, Participant> _byEp = new();
     private int _nextId = 1;
-    private int _broadcasterId = -1;
-    private SharePreset _preset = SharePreset.P720_30;
 
     public event Action<string>? Log;
     public int Port => _port;
@@ -43,7 +43,6 @@ public sealed class RoomServer : IDisposable
         {
             EnableBroadcast = true
         };
-        // buffers maiores ajudam no video em rajada
         try { _sock.ReceiveBufferSize = 1 << 20; _sock.SendBufferSize = 1 << 20; } catch { }
         _sock.Bind(new IPEndPoint(IPAddress.Any, _port));
 
@@ -61,8 +60,7 @@ public sealed class RoomServer : IDisposable
             while (!ct.IsCancellationRequested)
             {
                 var r = await _sock!.ReceiveFromAsync(buf, SocketFlags.None, from, ct);
-                var ep = (IPEndPoint)r.RemoteEndPoint;
-                Handle(buf, r.ReceivedBytes, ep);
+                Handle(buf, r.ReceivedBytes, (IPEndPoint)r.RemoteEndPoint);
             }
         }
         catch (OperationCanceledException) { }
@@ -73,9 +71,8 @@ public sealed class RoomServer : IDisposable
     private void Handle(byte[] buf, int len, IPEndPoint ep)
     {
         if (len < 1) return;
-        var type = (MsgType)buf[0];
 
-        switch (type)
+        switch ((MsgType)buf[0])
         {
             case MsgType.Join:
             {
@@ -98,59 +95,53 @@ public sealed class RoomServer : IDisposable
                 break;
             }
             case MsgType.Hello:
-            {
                 lock (_lock)
                     if (_byEp.TryGetValue(ep, out var p)) p.LastSeen = DateTime.UtcNow;
                 break;
-            }
+
             case MsgType.Leave:
-            {
-                RemoveParticipant(ep);
+                lock (_lock) _byEp.Remove(ep);
                 BroadcastRoster();
                 break;
-            }
+
             case MsgType.StartShare:
             {
-                if (len < 6) break;
+                if (len < 7) break;
                 var preset = (SharePreset)buf[5];
+                var codec = (CodecKind)buf[6];
                 lock (_lock)
                 {
                     if (_byEp.TryGetValue(ep, out var p))
                     {
-                        _broadcasterId = p.Id;
-                        _preset = preset;
+                        p.Sharing = true;
+                        p.Preset = preset;
+                        p.Codec = codec;
                         p.LastSeen = DateTime.UtcNow;
                     }
                 }
                 BroadcastRoster();
-                Log?.Invoke($"Compartilhando: {Presets.Get(preset).Label}");
                 break;
             }
             case MsgType.StopShare:
-            {
                 lock (_lock)
-                {
-                    if (_byEp.TryGetValue(ep, out var p) && p.Id == _broadcasterId)
-                        _broadcasterId = -1;
-                }
+                    if (_byEp.TryGetValue(ep, out var p)) p.Sharing = false;
                 BroadcastRoster();
                 break;
-            }
+
             case MsgType.Video:
-            {
                 RelayVideo(buf, len, ep);
                 break;
-            }
         }
     }
 
+    // Agora relaya o video de QUALQUER participante que esteja compartilhando.
     private void RelayVideo(byte[] buf, int len, IPEndPoint sender)
     {
         Participant[] targets;
         lock (_lock)
         {
-            if (!_byEp.TryGetValue(sender, out var sp) || sp.Id != _broadcasterId)
-                return; // so o broadcaster atual pode transmitir
+            if (!_byEp.TryGetValue(sender, out var sp) || !sp.Sharing)
+                return; // so quem esta compartilhando pode transmitir
             sp.LastSeen = DateTime.UtcNow;
             targets = _byEp.Values.Where(p => !p.EndPoint.Equals(sender)).ToArray();
         }
@@ -173,27 +164,22 @@ public sealed class RoomServer : IDisposable
         SendTo(b, b.Length, ep);
     }
 
+    // Roster: cada participante carrega sharing + preset + codec.
+    // [type][ushort count] then per p: [int id][byte sharing][byte preset][byte codec][byte nameLen][name]
     private void BroadcastRoster()
     {
         Participant[] list;
-        int bId; SharePreset preset;
-        lock (_lock)
-        {
-            list = _byEp.Values.ToArray();
-            bId = _broadcasterId;
-            preset = _preset;
-        }
+        lock (_lock) list = _byEp.Values.ToArray();
 
-        // [type][broadcasterPresent][int bId][preset][ushort count] then per p: [int id][byte nameLen][name]
         using var ms = new MemoryStream(256);
         ms.WriteByte((byte)MsgType.Roster);
-        ms.WriteByte((byte)(bId >= 0 ? 1 : 0));
-        WriteInt(ms, bId);
-        ms.WriteByte((byte)preset);
         WriteUShort(ms, (ushort)list.Length);
         foreach (var p in list)
         {
             WriteInt(ms, p.Id);
+            ms.WriteByte((byte)(p.Sharing ? 1 : 0));
+            ms.WriteByte((byte)p.Preset);
+            ms.WriteByte((byte)p.Codec);
             var nb = Encoding.UTF8.GetBytes(p.Name);
             if (nb.Length > 255) nb = nb[..255];
             ms.WriteByte((byte)nb.Length);
@@ -216,15 +202,6 @@ public sealed class RoomServer : IDisposable
         s.Write(t);
     }
 
-    private void RemoveParticipant(IPEndPoint ep)
-    {
-        lock (_lock)
-        {
-            if (_byEp.Remove(ep, out var p) && p.Id == _broadcasterId)
-                _broadcasterId = -1;
-        }
-    }
-
     private async Task MaintenanceLoop(CancellationToken ct)
     {
         var announce = Encoding.UTF8.GetBytes(
@@ -234,25 +211,16 @@ public sealed class RoomServer : IDisposable
         {
             while (!ct.IsCancellationRequested)
             {
-                // timeout de quem sumiu (>5s)
                 bool changed = false;
                 lock (_lock)
                 {
                     var dead = _byEp.Where(k => (DateTime.UtcNow - k.Value.LastSeen).TotalSeconds > 5)
                                     .Select(k => k.Key).ToList();
-                    foreach (var k in dead)
-                    {
-                        if (_byEp.Remove(k, out var p) && p.Id == _broadcasterId)
-                            _broadcasterId = -1;
-                        changed = true;
-                    }
+                    foreach (var k in dead) { _byEp.Remove(k); changed = true; }
                 }
                 if (changed) BroadcastRoster();
-
-                // roster periodico
                 if (tick % 2 == 0) BroadcastRoster();
 
-                // anuncio na LAN (a cada ~1.5s)
                 foreach (var b in NetworkUtils.GetBroadcastAddresses())
                     SendTo(announce, announce.Length, new IPEndPoint(b, Protocol.DiscoveryPort));
 

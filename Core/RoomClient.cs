@@ -6,13 +6,14 @@ using System.Text;
 
 namespace ScreenShareLan;
 
-public sealed record RosterEntry(int Id, string Name);
+// Cada participante carrega seu estado de compartilhamento + o codec que esta usando.
+public sealed record RosterEntry(int Id, string Name, bool Sharing, SharePreset Preset, CodecKind Codec);
 
 /// <summary>
-/// Participante da sala (host e convidados usam esta mesma classe).
-/// Fala tudo UDP com o servidor: entra, manda keepalive, pode compartilhar a
-/// tela (captura -> JPEG -> fragmenta -> envia) e recebe o video de quem estiver
-/// compartilhando (remonta os fragmentos -> decodifica -> dispara FrameReceived).
+/// Participante da sala (host e convidados usam a mesma classe). Tudo UDP.
+/// Varios broadcasters ao mesmo tempo: 1 reassembler + 1 decoder por sender.
+/// O encoder e escolhido por quem compartilha; o codec vai no protocolo pra quem
+/// assiste abrir o decoder certo.
 /// </summary>
 public sealed class RoomClient : IDisposable
 {
@@ -26,18 +27,26 @@ public sealed class RoomClient : IDisposable
 
     private int _myId = -1;
     private volatile bool _sharing;
-    private CancellationTokenSource? _captureCts;
+    private IVideoEncoder? _encoder;
     private uint _frameId;
     private readonly object _sendLock = new();
 
-    private readonly Reassembler _reasm = new();
+    // recepcao (tudo acessado pela thread do ReceiveLoop; locks cobrem o Dispose da UI)
+    private readonly Dictionary<int, Reassembler> _reasm = new();
+    private readonly object _reasmLock = new();
+
+    private readonly Dictionary<int, IVideoDecoder> _decoders = new();
+    private readonly Dictionary<int, (SharePreset preset, CodecKind codec)> _decoderCfg = new();
+    private readonly Dictionary<int, (SharePreset preset, CodecKind codec)> _senderInfo = new();
+    private readonly HashSet<int> _keyed = new();
+    private readonly object _decLock = new();
 
     public int MyId => _myId;
     public bool IsSharing => _sharing;
 
     public event Action<string>? StatusChanged;
-    public event Action<IReadOnlyList<RosterEntry>, int, SharePreset>? RosterUpdated; // (pessoas, broadcasterId(-1=ninguem), preset)
-    public event Action<int, Image>? FrameReceived; // (senderId, frame)
+    public event Action<IReadOnlyList<RosterEntry>>? RosterUpdated;
+    public event Action<int, Image>? FrameReceived;   // (senderId, frame)
     public event Action<bool>? ShareStateChanged;
 
     public RoomClient(string serverHost, int serverPort, string name)
@@ -50,8 +59,7 @@ public sealed class RoomClient : IDisposable
     public void Start()
     {
         _cts = new CancellationTokenSource();
-        var addr = ResolveHost(_serverHost);
-        _serverEp = new IPEndPoint(addr, _serverPort);
+        _serverEp = new IPEndPoint(ResolveHost(_serverHost), _serverPort);
 
         _sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         try { _sock.ReceiveBufferSize = 1 << 20; _sock.SendBufferSize = 1 << 20; } catch { }
@@ -67,8 +75,7 @@ public sealed class RoomClient : IDisposable
     private static IPAddress ResolveHost(string host)
     {
         if (IPAddress.TryParse(host, out var ip)) return ip;
-        var addrs = Dns.GetHostAddresses(host);
-        foreach (var a in addrs)
+        foreach (var a in Dns.GetHostAddresses(host))
             if (a.AddressFamily == AddressFamily.InterNetwork) return a;
         return IPAddress.Loopback;
     }
@@ -152,129 +159,166 @@ public sealed class RoomClient : IDisposable
         }
     }
 
+    // [type][ushort count] then per p: [int id][byte sharing][byte preset][byte codec][byte nameLen][name]
     private void ParseRoster(byte[] buf, int len)
     {
         try
         {
             int o = 1;
-            bool present = buf[o++] != 0;
-            int bId = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(o)); o += 4;
-            var preset = (SharePreset)buf[o++];
             ushort count = BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(o)); o += 2;
 
             var people = new List<RosterEntry>(count);
-            for (int i = 0; i < count && o + 5 <= len; i++)
+            for (int i = 0; i < count && o + 8 <= len; i++)
             {
                 int id = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(o)); o += 4;
+                bool sharing = buf[o++] != 0;
+                var preset = (SharePreset)buf[o++];
+                var codec = (CodecKind)buf[o++];
                 int nameLen = buf[o++];
                 if (o + nameLen > len) break;
                 string name = Encoding.UTF8.GetString(buf, o, nameLen); o += nameLen;
-                people.Add(new RosterEntry(id, name));
+                people.Add(new RosterEntry(id, name, sharing, preset, codec));
             }
-            RosterUpdated?.Invoke(people, present ? bId : -1, preset);
+
+            var active = people.Where(p => p.Sharing)
+                               .ToDictionary(p => p.Id, p => (p.Preset, p.Codec));
+
+            lock (_decLock)
+            {
+                _senderInfo.Clear();
+                foreach (var kv in active) _senderInfo[kv.Key] = kv.Value;
+
+                foreach (var id in _decoders.Keys.Where(k => !active.ContainsKey(k)).ToList())
+                {
+                    if (_decoders.Remove(id, out var d)) { try { d.Dispose(); } catch { } }
+                    _decoderCfg.Remove(id);
+                    _keyed.Remove(id);
+                }
+            }
+            lock (_reasmLock)
+            {
+                foreach (var k in _reasm.Keys.Where(k => !active.ContainsKey(k)).ToList())
+                    _reasm.Remove(k);
+            }
+
+            RosterUpdated?.Invoke(people);
         }
-        catch { /* pacote malformado, ignora */ }
+        catch { /* pacote malformado */ }
     }
 
     private void HandleVideo(byte[] buf, int len)
     {
         if (len < Protocol.VideoHeaderSize) return;
         int senderId = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(1));
-        if (senderId == _myId) return; // nao ecoa o proprio
+        if (senderId == _myId) return;
 
         uint frameId = BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(5));
         ushort idx = BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(9));
         ushort cnt = BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(11));
         ushort plen = BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(13));
+        byte flags = buf[15];
         if (Protocol.VideoHeaderSize + plen > len) return;
+        bool keyPacket = (flags & Protocol.FlagKeyFrame) != 0;
 
-        var complete = _reasm.Add(senderId, frameId, idx, cnt,
-            buf.AsSpan(Protocol.VideoHeaderSize, plen));
-        if (complete is null) return;
-
-        try
+        Reassembler r;
+        lock (_reasmLock)
         {
-            using var ms = new MemoryStream(complete, writable: false);
-            using var decoded = Image.FromStream(ms);
-            var copy = new Bitmap(decoded);
-            FrameReceived?.Invoke(senderId, copy);
+            if (!_reasm.TryGetValue(senderId, out var ex)) { r = new Reassembler(); _reasm[senderId] = r; }
+            else r = ex;
         }
-        catch { /* frame corrompido por perda de pacote: ignora */ }
+
+        var ef = r.Add(frameId, idx, cnt, keyPacket, buf.AsSpan(Protocol.VideoHeaderSize, plen));
+        if (ef is null) return;
+        var frame = ef.Value;
+
+        lock (_decLock)
+        {
+            if (!_senderInfo.TryGetValue(senderId, out var info)) return; // ainda sem roster desse sender
+
+            // mudou codec/preset -> reinicia decoder e exige keyframe de novo
+            if (_decoderCfg.TryGetValue(senderId, out var cfg) && !cfg.Equals(info))
+            {
+                if (_decoders.Remove(senderId, out var old)) { try { old.Dispose(); } catch { } }
+                _decoderCfg.Remove(senderId);
+                _keyed.Remove(senderId);
+            }
+
+            // so comeca a decodificar a partir de um keyframe (evita lixo)
+            if (!_keyed.Contains(senderId))
+            {
+                if (!frame.KeyFrame) return;
+                _keyed.Add(senderId);
+            }
+
+            if (!_decoders.TryGetValue(senderId, out var dec))
+            {
+                int sid = senderId;
+                dec = VideoFactory.CreateDecoder(info.codec, info.preset);
+                dec.FrameDecoded += img => FrameReceived?.Invoke(sid, img);
+                _decoders[senderId] = dec;
+                _decoderCfg[senderId] = info;
+            }
+            dec.Push(frame);
+        }
     }
 
     // ---------- compartilhamento ----------
-    public void StartShare(SharePreset preset)
+    public void StartShare(SharePreset preset, CodecKind codec)
     {
         if (_sharing || _myId < 0) return;
         _sharing = true;
         ShareStateChanged?.Invoke(true);
 
-        var b = new byte[6];
+        // msg: [type][int id][byte preset][byte codec]
+        var b = new byte[7];
         b[0] = (byte)MsgType.StartShare;
         BinaryPrimitives.WriteInt32LittleEndian(b.AsSpan(1), _myId);
         b[5] = (byte)preset;
+        b[6] = (byte)codec;
         SendRaw(b, b.Length);
 
-        _captureCts = new CancellationTokenSource();
-        var ct = _captureCts.Token;
-        _ = Task.Run(() => CaptureLoop(preset, ct));
+        _encoder = VideoFactory.CreateEncoder(codec, preset);
+        _encoder.FrameReady += SendEncoded;
+        _encoder.Start();
     }
 
     public void StopShare()
     {
         if (!_sharing) return;
         _sharing = false;
-        try { _captureCts?.Cancel(); } catch { }
+        try { _encoder?.Dispose(); } catch { }
+        _encoder = null;
         SendIdMsg(MsgType.StopShare);
         ShareStateChanged?.Invoke(false);
     }
 
-    private void CaptureLoop(SharePreset preset, CancellationToken ct)
+    // fragmenta 1 frame codificado em pacotes UDP e envia pro servidor (que faz relay)
+    private void SendEncoded(EncodedFrame ef)
     {
-        var info = Presets.Get(preset);
-        int frameMs = 1000 / info.Fps;
-        var sw = new System.Diagnostics.Stopwatch();
-        var header = new byte[Protocol.VideoHeaderSize];
+        int total = ef.Data.Length;
+        if (total == 0) return;
 
-        try
+        uint fid = unchecked(_frameId++);
+        int count = (total + Protocol.MaxUdpPayload - 1) / Protocol.MaxUdpPayload;
+        if (count > ushort.MaxValue) return;
+        byte flags = ef.KeyFrame ? Protocol.FlagKeyFrame : (byte)0;
+
+        for (int i = 0; i < count; i++)
         {
-            using var cap = new ScreenCapture(info.Width, info.Height, info.Quality, drawCursor: true);
-            while (!ct.IsCancellationRequested)
-            {
-                sw.Restart();
-                byte[] jpeg;
-                try { jpeg = cap.CaptureJpeg(); }
-                catch { break; }
+            int off = i * Protocol.MaxUdpPayload;
+            int plen = Math.Min(Protocol.MaxUdpPayload, total - off);
 
-                uint fid = unchecked(_frameId++);
-                int total = jpeg.Length;
-                int count = (total + Protocol.MaxUdpPayload - 1) / Protocol.MaxUdpPayload;
-                if (count > ushort.MaxValue) continue; // frame absurdo, pula
-
-                for (int i = 0; i < count; i++)
-                {
-                    int off = i * Protocol.MaxUdpPayload;
-                    int plen = Math.Min(Protocol.MaxUdpPayload, total - off);
-
-                    header[0] = (byte)MsgType.Video;
-                    BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(1), _myId);
-                    BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(5), fid);
-                    BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(9), (ushort)i);
-                    BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(11), (ushort)count);
-                    BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(13), (ushort)plen);
-
-                    // monta o datagrama (header + pedaco) e envia
-                    var packet = new byte[Protocol.VideoHeaderSize + plen];
-                    Buffer.BlockCopy(header, 0, packet, 0, Protocol.VideoHeaderSize);
-                    Buffer.BlockCopy(jpeg, off, packet, Protocol.VideoHeaderSize, plen);
-                    SendRaw(packet, packet.Length);
-                }
-
-                int wait = frameMs - (int)sw.ElapsedMilliseconds;
-                if (wait > 0) Thread.Sleep(wait);
-            }
+            var packet = new byte[Protocol.VideoHeaderSize + plen];
+            packet[0] = (byte)MsgType.Video;
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(1), _myId);
+            BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(5), fid);
+            BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(9), (ushort)i);
+            BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(11), (ushort)count);
+            BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(13), (ushort)plen);
+            packet[15] = flags;
+            Buffer.BlockCopy(ef.Data, off, packet, Protocol.VideoHeaderSize, plen);
+            SendRaw(packet, packet.Length);
         }
-        catch { }
     }
 
     public void Dispose()
@@ -282,43 +326,47 @@ public sealed class RoomClient : IDisposable
         try { StopShare(); } catch { }
         try { if (_myId >= 0) SendIdMsg(MsgType.Leave); } catch { }
         try { _cts?.Cancel(); } catch { }
+        lock (_decLock)
+        {
+            foreach (var d in _decoders.Values) { try { d.Dispose(); } catch { } }
+            _decoders.Clear();
+        }
         try { _sock?.Close(); } catch { }
         try { _sock?.Dispose(); } catch { }
     }
 }
 
-/// <summary>Remonta os fragmentos de um frame. Frame incompleto e descartado quando chega um novo.</summary>
+/// <summary>Remonta os fragmentos de um frame de UM sender. Frame incompleto e descartado quando chega um novo.</summary>
 internal sealed class Reassembler
 {
-    private int _senderId = -1;
     private uint _frameId;
+    private bool _has;
+    private bool _key;
     private int _count;
     private int _received;
     private byte[]?[] _parts = Array.Empty<byte[]?>();
     private readonly object _lock = new();
 
-    public byte[]? Add(int senderId, uint frameId, int idx, int count, ReadOnlySpan<byte> data)
+    public EncodedFrame? Add(uint frameId, int idx, int count, bool keyFrame, ReadOnlySpan<byte> data)
     {
         lock (_lock)
         {
-            bool sameFrame = senderId == _senderId && frameId == _frameId;
-            if (!sameFrame)
+            if (!_has || frameId != _frameId)
             {
-                // ignora sobra de frame antigo do mesmo sender
-                if (senderId == _senderId && (int)(frameId - _frameId) < 0) return null;
-                _senderId = senderId;
+                if (_has && (int)(frameId - _frameId) < 0) return null; // sobra de frame antigo
+                _has = true;
                 _frameId = frameId;
                 _count = count;
                 _received = 0;
+                _key = keyFrame;
                 _parts = new byte[count][];
             }
 
             if (idx < 0 || idx >= _count) return null;
-            if (_parts[idx] != null) return null; // duplicado
+            if (_parts[idx] != null) return null;
 
             _parts[idx] = data.ToArray();
             _received++;
-
             if (_received != _count) return null;
 
             int total = 0;
@@ -331,11 +379,10 @@ internal sealed class Reassembler
                 Buffer.BlockCopy(part, 0, full, o, part.Length);
                 o += part.Length;
             }
-            // zera pra nao remontar de novo
+            bool key = _key;
             _parts = Array.Empty<byte[]?>();
-            _count = 0;
-            _received = 0;
-            return full;
+            _count = 0; _received = 0; _has = false;
+            return new EncodedFrame(full, key);
         }
     }
 }

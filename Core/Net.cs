@@ -26,22 +26,31 @@ public enum SharePreset : byte
     P1080_60 = 3,
 }
 
-public readonly record struct PresetInfo(int Width, int Height, int Fps, int Quality, string Label);
+public readonly record struct PresetInfo(int Width, int Height, int Fps, int Quality, int BitrateKbps, string Label);
 
 public static class Presets
 {
-    // Largura/altura = teto do frame (mantem proporcao). Quality = JPEG.
+    // Width/Height = tamanho exato do quadro (H.264 pad); Quality = JPEG; BitrateKbps = alvo H.264.
     public static PresetInfo Get(SharePreset p) => p switch
     {
-        SharePreset.P720_30  => new PresetInfo(1280,  720, 30, 65, "720p 30FPS"),
-        SharePreset.P720_60  => new PresetInfo(1280,  720, 60, 58, "720p 60FPS"),
-        SharePreset.P1080_30 => new PresetInfo(1920, 1080, 30, 62, "1080p 30FPS"),
-        SharePreset.P1080_60 => new PresetInfo(1920, 1080, 60, 55, "1080p 60FPS"),
-        _                    => new PresetInfo(1280,  720, 30, 65, "720p 30FPS"),
+        SharePreset.P720_30  => new PresetInfo(1280,  720, 30, 65, 2500, "720p 30FPS"),
+        SharePreset.P720_60  => new PresetInfo(1280,  720, 60, 58, 4000, "720p 60FPS"),
+        SharePreset.P1080_30 => new PresetInfo(1920, 1080, 30, 62, 5000, "1080p 30FPS"),
+        SharePreset.P1080_60 => new PresetInfo(1920, 1080, 60, 55, 8000, "1080p 60FPS"),
+        _                    => new PresetInfo(1280,  720, 30, 65, 2500, "720p 30FPS"),
     };
 
     public static readonly SharePreset[] All =
         { SharePreset.P720_30, SharePreset.P720_60, SharePreset.P1080_30, SharePreset.P1080_60 };
+}
+
+// Tipo de encoder/decoder de video. Vai junto no protocolo pra quem assiste
+// saber qual decoder abrir. Novos codecs entram aqui (ex.: WindowsApi na 2.2).
+public enum CodecKind : byte
+{
+    Jpeg       = 0,
+    Ffmpeg     = 1,
+    WindowsApi = 2, // 2.2 (ainda nao implementado)
 }
 
 public static class Protocol
@@ -49,8 +58,10 @@ public static class Protocol
     public const int DiscoveryPort   = 45678;  // UDP: anuncio das salas (broadcast)
     public const int DefaultRoomPort = 45679;  // UDP: sala (controle + video)
 
-    public const int MaxUdpPayload   = 1200;   // bytes de JPEG por pacote (fica < MTU)
-    public const int VideoHeaderSize = 15;     // type(1)+sender(4)+frame(4)+idx(2)+count(2)+len(2)
+    public const int MaxUdpPayload   = 1200;   // bytes de payload por pacote (fica < MTU)
+    // type(1)+sender(4)+frame(4)+idx(2)+count(2)+len(2)+flags(1)
+    public const int VideoHeaderSize = 16;
+    public const byte FlagKeyFrame   = 0x01;   // bit0 do byte de flags
 
     public const string Magic = "SCRNSHR";
     public const string Version = "1";

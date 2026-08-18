@@ -28,10 +28,20 @@ public sealed class ScreenCapture : IDisposable
     private readonly ImageCodecInfo _jpeg;
     private readonly EncoderParameters _encParams;
 
-    public ScreenCapture(int targetW, int targetH, int quality, bool drawCursor = true)
+    // saida BGRA de tamanho exato (pra H.264) — opcional
+    private readonly bool _padToExact;
+    private readonly int _padW, _padH, _dstX, _dstY;
+    private readonly Bitmap? _bgra;
+    private readonly Graphics? _bgraG;
+
+    public int OutWidth  => _padToExact ? _padW : _outW;
+    public int OutHeight => _padToExact ? _padH : _outH;
+
+    public ScreenCapture(int targetW, int targetH, int quality, bool drawCursor = true, bool padToExact = false)
     {
         _bounds = Screen.PrimaryScreen!.Bounds;
         _drawCursor = drawCursor;
+        _padToExact = padToExact;
 
         // Escala pra caber na caixa alvo, sem ampliar (max 1.0).
         double scale = Math.Min(1.0, Math.Min(
@@ -52,10 +62,53 @@ public sealed class ScreenCapture : IDisposable
             _scaledG.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
         }
 
+        if (_padToExact)
+        {
+            // quadro exato targetW x targetH, com a tela centralizada (letterbox preto)
+            _padW = targetW; _padH = targetH;
+            _dstX = (_padW - _outW) / 2;
+            _dstY = (_padH - _outH) / 2;
+            _bgra = new Bitmap(_padW, _padH, PixelFormat.Format32bppArgb);
+            _bgraG = Graphics.FromImage(_bgra);
+            _bgraG.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Bilinear;
+            _bgraG.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
+        }
+
         _jpeg = GetEncoder(ImageFormat.Jpeg);
         _encParams = new EncoderParameters(1);
         _encParams.Param[0] = new EncoderParameter(
             Encoder.Quality, (long)Math.Clamp(quality, 10, 95));
+    }
+
+    /// <summary>Captura um frame e devolve BGRA compacto de OutWidth x OutHeight (pra H.264). Requer padToExact=true.</summary>
+    public byte[] CaptureRawBgra()
+    {
+        if (!_padToExact) throw new InvalidOperationException("Use padToExact=true pra CaptureRawBgra.");
+
+        _fullG.CopyFromScreen(_bounds.Location, Point.Empty, _bounds.Size);
+        if (_drawCursor) DrawCursor(_fullG, _bounds);
+
+        _bgraG!.Clear(Color.Black);
+        _bgraG.DrawImage(_full, _dstX, _dstY, _outW, _outH);
+
+        var rect = new Rectangle(0, 0, _padW, _padH);
+        var data = _bgra!.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        try
+        {
+            int rowBytes = _padW * 4;
+            var outBuf = new byte[rowBytes * _padH];
+            if (data.Stride == rowBytes)
+            {
+                Marshal.Copy(data.Scan0, outBuf, 0, outBuf.Length);
+            }
+            else
+            {
+                for (int y = 0; y < _padH; y++)
+                    Marshal.Copy(data.Scan0 + y * data.Stride, outBuf, y * rowBytes, rowBytes);
+            }
+            return outBuf;
+        }
+        finally { _bgra.UnlockBits(data); }
     }
 
     public byte[] CaptureJpeg()
@@ -128,6 +181,8 @@ public sealed class ScreenCapture : IDisposable
         _full.Dispose();
         _scaledG?.Dispose();
         _scaled?.Dispose();
+        _bgraG?.Dispose();
+        _bgra?.Dispose();
         _encParams.Dispose();
     }
 }
